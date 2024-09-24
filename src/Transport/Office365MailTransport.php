@@ -5,6 +5,7 @@ namespace Office365Mail\Transport;
 use Illuminate\Support\Str;
 use Microsoft\Graph\Graph;
 use Microsoft\Graph\Model\UploadSession;
+use Symfony\Component\Mailer\Exception\TransportException;
 use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\AbstractTransport;
 use Symfony\Component\Mime\Email;
@@ -14,101 +15,105 @@ class Office365MailTransport extends AbstractTransport
 {
     protected function doSend(SentMessage $message): void
     {
-        $email = MessageConverter::toEmail($message->getOriginalMessage());
+        try {
+            $email = MessageConverter::toEmail($message->getOriginalMessage());
 
-        $graph = new Graph();
+            $graph = new Graph();
 
-        $graph->setAccessToken($this->getAccessToken());
+            $graph->setAccessToken($this->getAccessToken());
 
-        // Special treatment if the message has too large attachments
-        $messageBody = $this->getBody($email, !!$email->getAttachments());
-        $messageBodySizeMb = json_encode($messageBody);
-        $messageBodySizeMb = strlen($messageBodySizeMb);
-        $messageBodySizeMb = $messageBodySizeMb / 1048576; //byte -> mb
+            // Special treatment if the message has too large attachments
+            $messageBody = $this->getBody($email, !!$email->getAttachments());
+            $messageBodySizeMb = json_encode($messageBody);
+            $messageBodySizeMb = strlen($messageBodySizeMb);
+            $messageBodySizeMb = $messageBodySizeMb / 1048576; //byte -> mb
 
-        if ($messageBodySizeMb >= 4) {
-            unset($messageBody);
-            $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages")
-                ->attachBody($this->getBody($email)["message"])
-                ->setReturnType(\Microsoft\Graph\Model\Message::class)
-                ->execute();
+            if ($messageBodySizeMb >= 4) {
+                unset($messageBody);
+                $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages")
+                    ->attachBody($this->getBody($email)["message"])
+                    ->setReturnType(\Microsoft\Graph\Model\Message::class)
+                    ->execute();
 
-            foreach ($email->getAttachments() as $attachment) {
-                $fileName = $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename');
-                $content = $attachment->getBody();
-                $fileSize = strlen($content);
-                $size = $fileSize / 1048576; //byte -> mb
-                $id = Str::random(10);
-                $attachmentMessage = [
-                    'AttachmentItem' => [
-                        'attachmentType' => 'file',
-                        'name' => $fileName,
-                        'size' => strlen($content)
-                    ]
-                ];
-
-                if ($size <= 3) { //ErrorAttachmentSizeShouldNotBeLessThanMinimumSize if attachment <= 3mb, then we need to add this
-                    $attachmentBody = [
-                        "@odata.type" => "#microsoft.graph.fileAttachment",
-                        "name" => $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename'),
-                        "contentType" => $attachment->getPreparedHeaders()->get('Content-Type')->getValue(),
-                        "contentBytes" => base64_encode($attachment->getBody()),
-                        'contentId'    => $id
+                foreach ($email->getAttachments() as $attachment) {
+                    $fileName = $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename');
+                    $content = $attachment->getBody();
+                    $fileSize = strlen($content);
+                    $size = $fileSize / 1048576; //byte -> mb
+                    $id = Str::random(10);
+                    $attachmentMessage = [
+                        'AttachmentItem' => [
+                            'attachmentType' => 'file',
+                            'name' => $fileName,
+                            'size' => strlen($content)
+                        ]
                     ];
 
-                    $addAttachment = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments")
-                        ->attachBody($attachmentBody)
-                        ->setReturnType(UploadSession::class)
-                        ->execute();
-                } else {
-                    //upload the files in chunks of 4mb....
-                    $uploadSession = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments/createUploadSession")
-                        ->attachBody($attachmentMessage)
-                        ->setReturnType(UploadSession::class)
-                        ->execute();
-
-                    $fragSize =  1024 * 1024 * 4; //4mb at once...
-                    $numFragments = ceil($fileSize / $fragSize);
-                    $contentChunked = str_split($content, $fragSize);
-                    $bytesRemaining = $fileSize;
-
-                    $i = 0;
-                    while ($i < $numFragments) {
-                        $chunkSize = $numBytes = $fragSize;
-                        $start = $i * $fragSize;
-                        $end = $i * $fragSize + $chunkSize - 1;
-                        if ($bytesRemaining < $chunkSize) {
-                            $chunkSize = $numBytes = $bytesRemaining;
-                            $end = $fileSize - 1;
-                        }
-                        $data = $contentChunked[$i];
-                        $content_range = "bytes " . $start . "-" . $end . "/" . $fileSize;
-                        $headers = [
-                            "Content-Length" => $numBytes,
-                            "Content-Range" => $content_range
+                    if ($size <= 3) { //ErrorAttachmentSizeShouldNotBeLessThanMinimumSize if attachment <= 3mb, then we need to add this
+                        $attachmentBody = [
+                            "@odata.type" => "#microsoft.graph.fileAttachment",
+                            "name" => $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename'),
+                            "contentType" => $attachment->getPreparedHeaders()->get('Content-Type')->getValue(),
+                            "contentBytes" => base64_encode($attachment->getBody()),
+                            'contentId'    => $id
                         ];
-                        $client = new \GuzzleHttp\Client();
-                        $tmp = $client->put($uploadSession->getUploadUrl(), [
-                            'headers'         => $headers,
-                            'body'            => $data,
-                            'allow_redirects' => false,
-                            'timeout'         => 1000
-                        ]);
-                        $result = $tmp->getBody() . '';
-                        $result = json_decode($result); //if body == empty, then the file was successfully uploaded
-                        $bytesRemaining = $bytesRemaining - $chunkSize;
-                        $i++;
+
+                        $addAttachment = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments")
+                            ->attachBody($attachmentBody)
+                            ->setReturnType(UploadSession::class)
+                            ->execute();
+                    } else {
+                        //upload the files in chunks of 4mb....
+                        $uploadSession = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments/createUploadSession")
+                            ->attachBody($attachmentMessage)
+                            ->setReturnType(UploadSession::class)
+                            ->execute();
+
+                        $fragSize =  1024 * 1024 * 4; //4mb at once...
+                        $numFragments = ceil($fileSize / $fragSize);
+                        $contentChunked = str_split($content, $fragSize);
+                        $bytesRemaining = $fileSize;
+
+                        $i = 0;
+                        while ($i < $numFragments) {
+                            $chunkSize = $numBytes = $fragSize;
+                            $start = $i * $fragSize;
+                            $end = $i * $fragSize + $chunkSize - 1;
+                            if ($bytesRemaining < $chunkSize) {
+                                $chunkSize = $numBytes = $bytesRemaining;
+                                $end = $fileSize - 1;
+                            }
+                            $data = $contentChunked[$i];
+                            $content_range = "bytes " . $start . "-" . $end . "/" . $fileSize;
+                            $headers = [
+                                "Content-Length" => $numBytes,
+                                "Content-Range" => $content_range
+                            ];
+                            $client = new \GuzzleHttp\Client();
+                            $tmp = $client->put($uploadSession->getUploadUrl(), [
+                                'headers'         => $headers,
+                                'body'            => $data,
+                                'allow_redirects' => false,
+                                'timeout'         => 1000
+                            ]);
+                            $result = $tmp->getBody() . '';
+                            $result = json_decode($result); //if body == empty, then the file was successfully uploaded
+                            $bytesRemaining = $bytesRemaining - $chunkSize;
+                            $i++;
+                        }
                     }
                 }
-            }
 
-            //definetly send the message
-            $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/send")->execute();
-        } else {
-            $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/sendmail")
-                ->attachBody($messageBody)
-                ->setReturnType(\Microsoft\Graph\Model\Message::class)
-                ->execute();
+                //definetly send the message
+                $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/send")->execute();
+            } else {
+                $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/sendmail")
+                    ->attachBody($messageBody)
+                    ->setReturnType(\Microsoft\Graph\Model\Message::class)
+                    ->execute();
+            }
+        } catch (\Exception $exception) {
+            throw new TransportException($exception->getMessage(), $exception->getCode(), $exception);
         }
     }
 
